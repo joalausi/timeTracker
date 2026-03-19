@@ -1,9 +1,0 @@
-{
-  "name": "com.example.time_tracker",
-  "description": "Minimal native host",
-  "path": "C:\\Users\\joell\\Desktop\\tt\\tt-host.exe",
-  "type": "stdio",
-  "allowed_origins": [
-    "chrome-extension://__EXTENSION_ID__/"
-  ]
-}
