@@ -1,0 +1,43 @@
+{
+  "rules": [
+    {
+      "name": "YouTube",
+      "action": "track",
+      "category": "entertainment",
+      "hostname_exact": ["youtube.com", "www.youtube.com"]
+    },
+    {
+      "name": "GitHub",
+      "action": "track",
+      "category": "development",
+      "hostname_exact": ["github.com", "www.github.com"]
+    },
+    {
+      "name": "Docs suffix",
+      "action": "track",
+      "category": "learning",
+      "hostname_suffix": [".docs.example.com"]
+    },
+    {
+      "name": "Knowledge Base path",
+      "action": "track",
+      "category": "knowledge",
+      "hostname_exact": ["intranet.local"],
+      "path_prefix": ["/kb", "/wiki"]
+    },
+    {
+      "name": "Exclude support subpath",
+      "action": "ignore",
+      "category": "excluded",
+      "hostname_exact": ["github.com"],
+      "path_prefix": ["/settings"]
+    },
+    {
+      "name": "Custom non-http regex",
+      "action": "ignore",
+      "category": "internal",
+      "url_regex": ["^chrome://"],
+      "allow_non_http": true
+    }
+  ]
+}

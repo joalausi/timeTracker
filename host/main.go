@@ -43,12 +43,12 @@ func writeMsg(w io.Writer, payload any) error {
 	return err
 }
 
-func eventsPath() (string, error) {
+func logPath(filename string) (string, error) {
 	exePath, err := os.Executable()
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(filepath.Dir(exePath), "events.jsonl"), nil
+	return filepath.Join(filepath.Dir(exePath), filename), nil
 }
 
 func appendJSONL(path string, payload any) error {
@@ -85,8 +85,20 @@ func toInt(v any) (int64, bool) {
 	}
 }
 
+func getString(payload map[string]any, key string) (string, bool) {
+	raw, ok := payload[key]
+	if !ok || raw == nil {
+		return "", false
+	}
+	value, ok := raw.(string)
+	if !ok {
+		return "", false
+	}
+	return value, true
+}
+
 func validateEvent(payload map[string]any) error {
-	name, ok := payload["name"].(string)
+	name, ok := getString(payload, "name")
 	if !ok || name == "" {
 		return fmt.Errorf("missing/invalid event name")
 	}
@@ -96,6 +108,7 @@ func validateEvent(payload map[string]any) error {
 		"tab_updated":          true,
 		"window_focus_changed": true,
 		"idle_state_changed":   true,
+		"tab_closed":           true,
 	}
 	if !allowed[name] {
 		return fmt.Errorf("unsupported event name: %s", name)
@@ -114,7 +127,42 @@ func validateEvent(payload map[string]any) error {
 	return nil
 }
 
-func handleMessage(msg []byte, eventsFile string) map[string]any {
+func validateSegment(payload map[string]any) error {
+	if _, ok := toInt(payload["start_ts_ms"]); !ok {
+		return fmt.Errorf("missing/invalid start_ts_ms")
+	}
+	end, ok := toInt(payload["end_ts_ms"])
+	if !ok {
+		return fmt.Errorf("missing/invalid end_ts_ms")
+	}
+	start, _ := toInt(payload["start_ts_ms"])
+	if end <= start {
+		return fmt.Errorf("invalid segment duration")
+	}
+
+	requiredStrings := []string{"url", "category", "rule", "reason"}
+	for _, key := range requiredStrings {
+		value, ok := getString(payload, key)
+		if !ok || value == "" {
+			return fmt.Errorf("missing/invalid %s", key)
+		}
+	}
+
+	if title, ok := payload["title"]; ok && title != nil {
+		if _, ok := title.(string); !ok {
+			return fmt.Errorf("invalid title")
+		}
+	}
+
+	return nil
+}
+
+type store struct {
+	eventsFile   string
+	segmentsFile string
+}
+
+func (s store) handleMessage(msg []byte) map[string]any {
 	var payload map[string]any
 	if err := json.Unmarshal(msg, &payload); err != nil {
 		return map[string]any{
@@ -140,7 +188,7 @@ func handleMessage(msg []byte, eventsFile string) map[string]any {
 				"error": err.Error(),
 			}
 		}
-		if err := appendJSONL(eventsFile, payload); err != nil {
+		if err := appendJSONL(s.eventsFile, payload); err != nil {
 			return map[string]any{
 				"ok":    false,
 				"type":  "event_ack",
@@ -151,6 +199,25 @@ func handleMessage(msg []byte, eventsFile string) map[string]any {
 			"ok":   true,
 			"type": "event_ack",
 		}
+	case "segment":
+		if err := validateSegment(payload); err != nil {
+			return map[string]any{
+				"ok":    false,
+				"type":  "segment_ack",
+				"error": err.Error(),
+			}
+		}
+		if err := appendJSONL(s.segmentsFile, payload); err != nil {
+			return map[string]any{
+				"ok":    false,
+				"type":  "segment_ack",
+				"error": "failed to persist segment",
+			}
+		}
+		return map[string]any{
+			"ok":   true,
+			"type": "segment_ack",
+		}
 	default:
 		return map[string]any{
 			"ok":    false,
@@ -159,13 +226,24 @@ func handleMessage(msg []byte, eventsFile string) map[string]any {
 	}
 }
 
+
 func main() {
-	eventsFile, err := eventsPath()
+	eventsFile, err := logPath("events.jsonl")
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "[TT] events path error:", err)
 		return
 	}
+	segmentsFile, err := logPath("segments.jsonl")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "[TT] segments path error:", err)
+		return
+	}
+	storage := store{
+		eventsFile:   eventsFile,
+		segmentsFile: segmentsFile,
+	}
 	fmt.Fprintln(os.Stderr, "[TT] host boot, events file:", eventsFile)
+	fmt.Fprintln(os.Stderr, "[TT] host boot, segments file:", segmentsFile)
 	for {
 		msg, err := readMsg(os.Stdin)
 		if err != nil {
@@ -175,7 +253,7 @@ func main() {
 		}
 		fmt.Fprintln(os.Stderr, "[TT] got:", string(msg))
 
-		resp := handleMessage(msg, eventsFile)
+		resp := storage.handleMessage(msg)
 		if err := writeMsg(os.Stdout, resp); err != nil {
 			fmt.Fprintln(os.Stderr, "[TT] write:", err)
 			return

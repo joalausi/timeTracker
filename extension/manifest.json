@@ -2,7 +2,17 @@
   "manifest_version": 3,
   "name": "Time Tracker",
   "version": "0.0.1",
-  "permissions": ["nativeMessaging", "tabs", "windows", "idle"],
-  "background": { "service_worker": "sw.js" },
-  "action": { "default_title": "Ping native host" }
+  "permissions": [
+    "nativeMessaging",
+    "tabs",
+    "windows",
+    "idle",
+    "storage"
+  ],
+  "background": {
+    "service_worker": "sw.js"
+  },
+  "action": {
+    "default_title": "Ping native host"
+  }
 }
