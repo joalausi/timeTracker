@@ -56,6 +56,11 @@ function safeProtocol(urlValue) {
   }
 }
 
+function isHttpUrl(urlValue) {
+  const protocol = safeProtocol(urlValue);
+  return protocol === "http:" || protocol === "https:";
+}
+
 function sendRawEvent(name, details = {}) {
   const event = {
     type: "event",
@@ -409,12 +414,16 @@ chrome.tabs.onActivated.addListener((activeInfo) => {
     state.activeUrl = url;
     state.activeTitle = title;
 
-    sendRawEvent("tab_activated", {
-      tabId: activeInfo.tabId,
-      windowId: activeInfo.windowId,
-      url,
-      protocol: safeProtocol(url),
-    });
+    if (isHttpUrl(url)) {
+      sendRawEvent("tab_activated", {
+        tabId: activeInfo.tabId,
+        windowId: activeInfo.windowId,
+        url,
+        title,
+      });
+    } else {
+      console.log("[TT] skip tab_activated raw event for non-http(s) URL");
+    }
 
     await recomputeSegment("switch");
   });
@@ -422,15 +431,21 @@ chrome.tabs.onActivated.addListener((activeInfo) => {
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   enqueue(async () => {
-    const url = normalizeUrl(changeInfo.url || tab?.url);
+    if (!changeInfo.url) {
+      return;
+    }
 
-    sendRawEvent("tab_updated", {
-      tabId,
-      windowId: tab?.windowId,
-      status: changeInfo.status,
-      url,
-      protocol: safeProtocol(url),
-    });
+    const url = normalizeUrl(changeInfo.url);
+    if (isHttpUrl(url)) {
+      sendRawEvent("tab_updated", {
+        tabId,
+        windowId: tab?.windowId,
+        url,
+        title: tab?.title,
+      });
+    } else {
+      console.log("[TT] skip tab_updated raw event for non-http(s) URL");
+    }
 
     if (tabId !== state.activeTabId) {
       return;
@@ -470,15 +485,14 @@ chrome.windows.onFocusChanged.addListener((windowId) => {
     sendRawEvent("window_focus_changed", {
       windowId,
       tabId,
-      url,
-      protocol: safeProtocol(url),
+      ...(isHttpUrl(url) ? { url, title: state.activeTitle } : {}),
     });
 
     await recomputeSegment("blur");
   });
 });
 
-chrome.tabs.onRemoved.addListener((tabId, removeInfo) => {
+chrome.tabs.onRemoved.addListener((tabId) => {
   enqueue(async () => {
     if (tabId !== state.activeTabId) {
       return;
@@ -487,11 +501,6 @@ chrome.tabs.onRemoved.addListener((tabId, removeInfo) => {
     state.activeTabId = null;
     state.activeUrl = undefined;
     state.activeTitle = undefined;
-
-    sendRawEvent("tab_closed", {
-      tabId,
-      windowId: removeInfo?.windowId,
-    });
 
     await recomputeSegment("close");
   });

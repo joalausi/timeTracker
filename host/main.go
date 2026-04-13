@@ -108,7 +108,6 @@ func validateEvent(payload map[string]any) error {
 		"tab_updated":          true,
 		"window_focus_changed": true,
 		"idle_state_changed":   true,
-		"tab_closed":           true,
 	}
 	if !allowed[name] {
 		return fmt.Errorf("unsupported event name: %s", name)
@@ -176,9 +175,8 @@ func (s store) handleMessage(msg []byte) map[string]any {
 	case "ping":
 		return map[string]any{
 			"ok":   true,
-			"type": "pong",
-			"ts":   time.Now().Format(time.RFC3339Nano),
-			"echo": payload,
+			"type": "ack",
+			"ts":   time.Now().UnixMilli(),
 		}
 	case "event":
 		if err := validateEvent(payload); err != nil {
@@ -225,7 +223,6 @@ func (s store) handleMessage(msg []byte) map[string]any {
 		}
 	}
 }
-
 
 func main() {
 	eventsFile, err := logPath("events.jsonl")
