@@ -13,6 +13,7 @@
     "service_worker": "sw.js"
   },
   "action": {
-    "default_title": "Ping native host"
+    "default_title": "Time Tracker",
+    "default_popup": "popup.html"
   }
 }

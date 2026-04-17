@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Time Tracker</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <main class="popup">
+      <header class="header">
+        <h1>Time Tracker</h1>
+        <p id="statusLine" class="muted">Loading state…</p>
+      </header>
+
+      <section class="card">
+        <div class="label">Current activity</div>
+        <div id="trackingState" class="value value-lg">Idle</div>
+        <div id="siteLine" class="muted">No active website yet</div>
+        <div id="titleLine" class="title">Open a tracked page to start</div>
+        <div class="meta-row">
+          <span>Category</span>
+          <strong id="categoryLine">—</strong>
+        </div>
+        <div class="meta-row">
+          <span>Current segment</span>
+          <strong id="segmentTimer">00:00:00</strong>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="label">Today</div>
+        <div class="value value-lg" id="todayTotal">00:00:00</div>
+        <div class="label label-tight">By category</div>
+        <ul id="breakdownList" class="list empty">
+          <li>No tracked segments for today yet.</li>
+        </ul>
+      </section>
+
+      <section class="card actions">
+        <button id="pingBtn" type="button">Ping host</button>
+        <button id="reloadBtn" type="button" class="secondary">Reload extension</button>
+        <p id="actionMessage" class="muted action-message"></p>
+      </section>
+    </main>
+
+    <script src="popup.js"></script>
+  </body>
+</html>

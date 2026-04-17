@@ -1,0 +1,156 @@
+:root {
+  color-scheme: dark;
+  --bg: #0c111b;
+  --card: #161d2b;
+  --card-2: #1d2536;
+  --text: #eef3ff;
+  --muted: #9da8c2;
+  --accent: #7c9cff;
+  --danger: #ff6d7f;
+  --ok: #4cd483;
+  --border: rgba(255, 255, 255, 0.08);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: Inter, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+}
+
+.popup {
+  width: 360px;
+  min-height: 460px;
+  padding: 14px;
+  display: grid;
+  gap: 12px;
+}
+
+.header h1 {
+  margin: 0;
+  font-size: 17px;
+  font-weight: 650;
+}
+
+.muted {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.card {
+  background: linear-gradient(180deg, var(--card), var(--card-2));
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 12px;
+  box-shadow: 0 10px 20px rgba(0, 0, 0, 0.2);
+}
+
+.label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+}
+
+.label-tight {
+  margin-top: 10px;
+}
+
+.value {
+  margin-top: 4px;
+  font-weight: 600;
+}
+
+.value-lg {
+  font-size: 25px;
+  line-height: 1.2;
+}
+
+.title {
+  margin-top: 6px;
+  font-size: 13px;
+  color: #d6ddf3;
+  max-height: 34px;
+  overflow: hidden;
+}
+
+.meta-row {
+  margin-top: 8px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.meta-row strong {
+  color: var(--text);
+  font-weight: 600;
+  margin-left: 8px;
+}
+
+.list {
+  margin: 8px 0 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 6px;
+}
+
+.list li {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 8px;
+  font-size: 13px;
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.list.empty li {
+  color: var(--muted);
+  justify-content: flex-start;
+}
+
+.actions {
+  display: grid;
+  gap: 8px;
+}
+
+button {
+  background: var(--accent);
+  color: #0e1420;
+  border: 0;
+  border-radius: 10px;
+  font-size: 13px;
+  font-weight: 700;
+  padding: 9px 10px;
+  cursor: pointer;
+}
+
+button.secondary {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text);
+}
+
+button:active {
+  transform: translateY(1px);
+}
+
+.state-ok {
+  color: var(--ok);
+}
+
+.state-error {
+  color: var(--danger);
+}
+
+.action-message {
+  min-height: 16px;
+}
