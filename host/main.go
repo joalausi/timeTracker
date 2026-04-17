@@ -7,11 +7,24 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"time"
 )
 
 const Max = 1024 * 1024
+
+type finalizedSegment struct {
+	StartTsMs  int64
+	EndTsMs    int64
+	DurationMs int64
+	URL        string
+	Hostname   string
+	Title      string
+	Category   string
+	Rule       string
+	Reason     string
+}
 
 func readMsg(r io.Reader) ([]byte, error) {
 	var lenBuf [4]byte
@@ -117,8 +130,8 @@ func validateEvent(payload map[string]any) error {
 		return fmt.Errorf("missing/invalid event ts")
 	}
 
-	if url, ok := payload["url"]; ok && url != nil {
-		if _, ok := url.(string); !ok {
+	if rawURL, ok := payload["url"]; ok && rawURL != nil {
+		if _, ok := rawURL.(string); !ok {
 			return fmt.Errorf("invalid url")
 		}
 	}
@@ -126,39 +139,60 @@ func validateEvent(payload map[string]any) error {
 	return nil
 }
 
-func validateSegment(payload map[string]any) error {
-	if _, ok := toInt(payload["start_ts_ms"]); !ok {
-		return fmt.Errorf("missing/invalid start_ts_ms")
-	}
-	end, ok := toInt(payload["end_ts_ms"])
+func parseSegment(payload map[string]any) (finalizedSegment, error) {
+	startTs, ok := toInt(payload["start_ts_ms"])
 	if !ok {
-		return fmt.Errorf("missing/invalid end_ts_ms")
+		return finalizedSegment{}, fmt.Errorf("missing/invalid start_ts_ms")
 	}
-	start, _ := toInt(payload["start_ts_ms"])
-	if end <= start {
-		return fmt.Errorf("invalid segment duration")
+	endTs, ok := toInt(payload["end_ts_ms"])
+	if !ok {
+		return finalizedSegment{}, fmt.Errorf("missing/invalid end_ts_ms")
+	}
+	if endTs <= startTs {
+		return finalizedSegment{}, fmt.Errorf("invalid segment duration")
+	}
+	duration := endTs - startTs
+	if providedDuration, ok := toInt(payload["duration_ms"]); ok && providedDuration > 0 {
+		duration = providedDuration
 	}
 
 	requiredStrings := []string{"url", "category", "rule", "reason"}
 	for _, key := range requiredStrings {
 		value, ok := getString(payload, key)
 		if !ok || value == "" {
-			return fmt.Errorf("missing/invalid %s", key)
+			return finalizedSegment{}, fmt.Errorf("missing/invalid %s", key)
 		}
+		values[key] = value
 	}
 
-	if title, ok := payload["title"]; ok && title != nil {
-		if _, ok := title.(string); !ok {
-			return fmt.Errorf("invalid title")
+	title, _ := getString(payload, "title")
+	hostname, _ := getString(payload, "hostname")
+	if hostname == "" {
+		parsed, err := url.Parse(values["url"])
+		if err == nil {
+			hostname = parsed.Hostname()
 		}
 	}
+	if hostname == "" {
+		hostname = "unknown"
+	}
 
-	return nil
+	return finalizedSegment{
+		StartTsMs:  startTs,
+		EndTsMs:    endTs,
+		DurationMs: duration,
+		URL:        values["url"],
+		Hostname:   hostname,
+		Title:      title,
+		Category:   values["category"],
+		Rule:       values["rule"],
+		Reason:     values["reason"],
+	}, nil
 }
 
 type store struct {
-	eventsFile   string
-	segmentsFile string
+	eventsFile string
+	sqlite     *sqliteStore
 }
 
 func (s store) handleMessage(msg []byte) map[string]any {
@@ -173,10 +207,15 @@ func (s store) handleMessage(msg []byte) map[string]any {
 	msgType, _ := payload["type"].(string)
 	switch msgType {
 	case "ping":
+		stats, err := s.sqlite.queryStatsToday(time.Now())
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "[TT] stats query error:", err)
+		}
 		return map[string]any{
-			"ok":   true,
-			"type": "ack",
-			"ts":   time.Now().UnixMilli(),
+			"ok":          true,
+			"type":        "ack",
+			"ts":          time.Now().UnixMilli(),
+			"stats_today": stats,
 		}
 	case "event":
 		if err := validateEvent(payload); err != nil {
@@ -198,23 +237,47 @@ func (s store) handleMessage(msg []byte) map[string]any {
 			"type": "event_ack",
 		}
 	case "segment":
-		if err := validateSegment(payload); err != nil {
+		seg, err := parseSegment(payload)
+		if err != nil {
 			return map[string]any{
 				"ok":    false,
 				"type":  "segment_ack",
 				"error": err.Error(),
 			}
 		}
-		if err := appendJSONL(s.segmentsFile, payload); err != nil {
+		if err := s.sqlite.insertSegment(seg); err != nil {
 			return map[string]any{
 				"ok":    false,
 				"type":  "segment_ack",
 				"error": "failed to persist segment",
 			}
 		}
+		stats, err := s.sqlite.queryStatsToday(time.Now())
+		if err != nil {
+			return map[string]any{
+				"ok":    false,
+				"type":  "segment_ack",
+				"error": "failed to query stats",
+			}
+		}
 		return map[string]any{
-			"ok":   true,
-			"type": "segment_ack",
+			"ok":          true,
+			"type":        "segment_ack",
+			"stats_today": stats,
+		}
+	case "stats_today":
+		stats, err := s.sqlite.queryStatsToday(time.Now())
+		if err != nil {
+			return map[string]any{
+				"ok":    false,
+				"type":  "stats_today_ack",
+				"error": "failed to query stats",
+			}
+		}
+		return map[string]any{
+			"ok":          true,
+			"type":        "stats_today_ack",
+			"stats_today": stats,
 		}
 	default:
 		return map[string]any{
@@ -230,17 +293,22 @@ func main() {
 		fmt.Fprintln(os.Stderr, "[TT] events path error:", err)
 		return
 	}
-	segmentsFile, err := logPath("segments.jsonl")
+	sqliteStore, dbPath, err := openSQLiteStore()
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "[TT] segments path error:", err)
+		fmt.Fprintln(os.Stderr, "[TT] sqlite init error:", err)
 		return
 	}
+	defer func() {
+		if err := sqliteStore.close(); err != nil {
+			fmt.Fprintln(os.Stderr, "[TT] sqlite close error:", err)
+		}
+	}()
 	storage := store{
-		eventsFile:   eventsFile,
-		segmentsFile: segmentsFile,
+		eventsFile: eventsFile,
+		sqlite:     sqliteStore,
 	}
 	fmt.Fprintln(os.Stderr, "[TT] host boot, events file:", eventsFile)
-	fmt.Fprintln(os.Stderr, "[TT] host boot, segments file:", segmentsFile)
+	fmt.Fprintln(os.Stderr, "[TT] host boot, sqlite:", dbPath)
 	for {
 		msg, err := readMsg(os.Stdin)
 		if err != nil {

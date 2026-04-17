@@ -3,6 +3,9 @@ const RULES_PATH = "rules.json";
 const ACTIVE_SEGMENT_LOCAL_KEY = "tt_current_active_segment";
 const TODAY_SUMMARY_LOCAL_KEY = "tt_today_summary";
 
+const UI_ACTIVE_KEY = "tt_active";
+const UI_STATS_TODAY_KEY = "tt_stats_today";
+const UI_HOST_STATUS_KEY = "tt_host_status";
 console.log("[TT] SW boot");
 
 const state = {
@@ -27,13 +30,43 @@ function enqueue(task) {
   return opQueue;
 }
 
+async function setHostStatus(partial) {
+  const prev = await chrome.storage.local.get(UI_HOST_STATUS_KEY);
+  const next = {
+    ...(prev[UI_HOST_STATUS_KEY] || {}),
+    ...partial,
+    updated_ts_ms: Date.now(),
+  };
+  await chrome.storage.local.set({ [UI_HOST_STATUS_KEY]: next });
+}
+
+function requestHost(payload) {
+  return new Promise((resolve) => {
+    chrome.runtime.sendNativeMessage(HOST, payload, async (resp) => {
+      if (chrome.runtime.lastError) {
+        const error = chrome.runtime.lastError.message;
+        console.warn("[TT] native send error:", error, payload);
+        await setHostStatus({ ok: false, last_error: error });
+        resolve({ ok: false, error });
+        return;
+      }
+
+      if (resp?.ok === false) {
+        const hostError = resp.error || "host returned error";
+        await setHostStatus({ ok: false, last_error: hostError });
+      } else {
+        await setHostStatus({ ok: true, last_error: null, last_ack_type: resp?.type || null });
+      }
+
+      console.log("[TT] host ack:", resp);
+      resolve(resp || { ok: false, error: "empty response" });
+    });
+  });
+}
+
 function sendToHost(payload) {
-  chrome.runtime.sendNativeMessage(HOST, payload, (resp) => {
-    if (chrome.runtime.lastError) {
-      console.warn("[TT] native send error:", chrome.runtime.lastError.message, payload);
-      return;
-    }
-    console.log("[TT] host ack:", resp);
+  requestHost(payload).catch((err) => {
+    console.warn("[TT] sendToHost requestHost failed", err);
   });
 }
 
@@ -42,6 +75,15 @@ function normalizeUrl(rawUrl) {
   try {
     const parsed = new URL(rawUrl);
     return parsed.toString();
+  } catch {
+    return undefined;
+  }
+}
+
+function getHostname(rawUrl) {
+  if (!rawUrl) return undefined;
+  try {
+    return new URL(rawUrl).hostname;
   } catch {
     return undefined;
   }
@@ -232,7 +274,7 @@ async function persistCurrentSegment() {
   });
 }
 
-async function updateTodaySummary(finalizedSegment) {
+async function updateTodaySummaryLocalFallback(finalizedSegment) {
   const dayKey = dayKeyFromTs(finalizedSegment.end_ts_ms);
   const { start: dayStart, end: dayEnd } = dayBoundsFromTs(finalizedSegment.end_ts_ms);
   const durationMs = overlapMs(finalizedSegment.start_ts_ms, finalizedSegment.end_ts_ms, dayStart, dayEnd);
@@ -262,8 +304,67 @@ async function updateTodaySummary(finalizedSegment) {
   const category = finalizedSegment.category || "uncategorized";
   summary.by_category[category] = (summary.by_category[category] || 0) + durationMs;
 
-  await chrome.storage.local.set({ [TODAY_SUMMARY_LOCAL_KEY]: summary });
-  console.log("[TT] updated today summary:", summary);
+  await chrome.storage.local.set({
+    [TODAY_SUMMARY_LOCAL_KEY]: summary,
+    [UI_STATS_TODAY_KEY]: {
+      day: summary.day,
+      total_ms: summary.total_ms,
+      by_category: summary.by_category,
+      by_hour: {},
+      source: "local-fallback",
+      updated_ts_ms: Date.now(),
+    },
+  });
+  console.log("[TT] updated today summary fallback:", summary);
+}
+
+async function publishActiveState() {
+  const trackingDecision = getTrackingDecision(state.activeUrl);
+  const tracking = Boolean(state.segment);
+
+  const payload = {
+    tracking,
+    tracker_state: tracking ? "Tracking" : "Idle",
+    window_focused: state.windowFocused,
+    idle_state: state.idleState,
+    tab_id: state.activeTabId,
+    window_id: state.activeWindowId,
+    url: state.activeUrl || null,
+    hostname: getHostname(state.activeUrl) || null,
+    title: state.activeTitle || null,
+    category: state.segment?.category || (trackingDecision.action === "track" ? trackingDecision.category : null),
+    rule: state.segment?.rule || (trackingDecision.action === "track" ? trackingDecision.rule : null),
+    start_ts_ms: state.segment?.start_ts_ms || null,
+    updated_ts_ms: Date.now(),
+  };
+
+  await chrome.storage.local.set({ [UI_ACTIVE_KEY]: payload });
+}
+
+async function storeStatsFromHostResponse(resp) {
+  if (!resp?.stats_today) return;
+  const stats = {
+    ...resp.stats_today,
+    source: "host",
+    updated_ts_ms: Date.now(),
+  };
+  await chrome.storage.local.set({
+    [TODAY_SUMMARY_LOCAL_KEY]: {
+      day: stats.day,
+      total_ms: stats.total_ms,
+      by_category: stats.by_category || {},
+    },
+    [UI_STATS_TODAY_KEY]: stats,
+  });
+}
+
+async function refreshStatsTodayFromHost() {
+  const resp = await requestHost({ type: "stats_today", ts: Date.now() });
+  if (resp?.ok && resp?.type === "stats_today_ack") {
+    await storeStatsFromHostResponse(resp);
+    return resp;
+  }
+  return resp;
 }
 
 function sameSegmentTarget(segment, target) {
@@ -292,6 +393,7 @@ async function startSegment(target) {
   };
   console.log("[TT] segment start:", state.segment);
   await persistCurrentSegment();
+  await publishActiveState();
 }
 
 async function finalizeSegment(reason) {
@@ -303,6 +405,7 @@ async function finalizeSegment(reason) {
     console.log("[TT] skip segment finalize due to non-positive duration");
     state.segment = null;
     await persistCurrentSegment();
+    await publishActiveState();
     return;
   }
 
@@ -310,7 +413,9 @@ async function finalizeSegment(reason) {
     type: "segment",
     start_ts_ms: current.start_ts_ms,
     end_ts_ms: endTs,
+    duration_ms: endTs - current.start_ts_ms,
     url: current.url,
+    hostname: getHostname(current.url),
     title: current.title,
     category: current.category,
     rule: current.rule,
@@ -318,11 +423,16 @@ async function finalizeSegment(reason) {
   };
 
   console.log("[TT] segment finalize:", payload);
-  sendToHost(payload);
-  await updateTodaySummary(payload);
+  const resp = await requestHost(payload);
+  if (resp?.ok) {
+    await storeStatsFromHostResponse(resp);
+  } else {
+    await updateTodaySummaryLocalFallback(payload);
+  }
 
   state.segment = null;
   await persistCurrentSegment();
+  await publishActiveState();
 }
 
 async function recomputeSegment(reason) {
@@ -341,7 +451,9 @@ async function recomputeSegment(reason) {
   if (state.segment && target && !sameSegmentTarget(state.segment, target)) {
     await finalizeSegment(reason);
     await startSegment(target);
+    return;
   }
+  await publishActiveState();
 }
 
 async function refreshActiveContext(windowId) {
@@ -377,7 +489,9 @@ async function bootstrapState() {
   }
 
   await persistCurrentSegment();
+  await publishActiveState();
   await recomputeSegment("bootstrap");
+  await refreshStatsTodayFromHost();
 }
 
 chrome.runtime.onStartup.addListener(() => {
@@ -394,7 +508,27 @@ chrome.runtime.onInstalled.addListener(() => {
 
 chrome.action.onClicked.addListener(() => {
   console.log("[TT] click -> ping");
-  sendToHost({ type: "ping", ts: Date.now() });
+  requestHost({ type: "ping", ts: Date.now() });
+});
+
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message?.type === "tt_ping_host") {
+    enqueue(async () => {
+      const resp = await requestHost({ type: "ping", ts: Date.now(), source: "popup" });
+      sendResponse(resp || { ok: false, error: "no response" });
+    });
+    return true;
+  }
+
+  if (message?.type === "tt_refresh_stats") {
+    enqueue(async () => {
+      const resp = await refreshStatsTodayFromHost();
+      sendResponse(resp || { ok: false, error: "no response" });
+    });
+    return true;
+  }
+
+  return false;
 });
 
 chrome.tabs.onActivated.addListener((activeInfo) => {
