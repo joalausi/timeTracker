@@ -22,6 +22,8 @@ const viewState = {
   host: null,
 };
 
+let popupOpenedNotified = false;
+
 function formatMs(ms) {
   const safe = Math.max(0, Number(ms) || 0);
   const totalSeconds = Math.floor(safe / 1000);
@@ -131,3 +133,21 @@ els.reloadBtn.addEventListener("click", () => {
 setInterval(render, 1000);
 refreshFromStorage();
 chrome.runtime.sendMessage({ type: "tt_refresh_stats" }).catch(() => {});
+
+async function notifyPopupOpened() {
+  if (popupOpenedNotified) return;
+  popupOpenedNotified = true;
+  try {
+    await chrome.runtime.sendMessage({ type: "tt_popup_opened" });
+  } catch {}
+}
+
+function notifyPopupClosed() {
+  if (!popupOpenedNotified) return;
+  popupOpenedNotified = false;
+  chrome.runtime.sendMessage({ type: "tt_popup_closed" }).catch(() => {});
+}
+
+notifyPopupOpened();
+window.addEventListener("unload", notifyPopupClosed);
+window.addEventListener("pagehide", notifyPopupClosed);

@@ -14,12 +14,15 @@ const state = {
   activeUrl: undefined,
   activeTitle: undefined,
   windowFocused: false,
+  popupOpen: false,
   idleState: "active",
   segment: null,
   rules: [],
 };
 
 let opQueue = Promise.resolve();
+let blurRecheckTimer = null;
+const BLUR_RECHECK_DEBOUNCE_MS = 450;
 
 function enqueue(task) {
   opQueue = opQueue
@@ -28,6 +31,44 @@ function enqueue(task) {
       console.warn("[TT] queue task failed:", err);
     });
   return opQueue;
+}
+
+function clearBlurRecheck() {
+  if (blurRecheckTimer) {
+    clearTimeout(blurRecheckTimer);
+    blurRecheckTimer = null;
+  }
+}
+
+function scheduleBlurRecheck(triggerReason = "blur") {
+  clearBlurRecheck();
+  blurRecheckTimer = setTimeout(() => {
+    enqueue(async () => {
+      if (state.popupOpen) {
+        await publishActiveState();
+        return;
+      }
+
+      try {
+        const win = await chrome.windows.getLastFocused({ populate: false });
+        if (win?.focused && win?.id != null && win.id !== chrome.windows.WINDOW_ID_NONE) {
+          state.windowFocused = true;
+          await refreshActiveContext(win.id);
+          await recomputeSegment("focus");
+          return;
+        }
+      } catch (err) {
+        console.warn("[TT] blur recheck failed:", err);
+      }
+
+      state.windowFocused = false;
+      state.activeWindowId = null;
+      state.activeTabId = null;
+      state.activeUrl = undefined;
+      state.activeTitle = undefined;
+      await recomputeSegment(triggerReason);
+    });
+  }, BLUR_RECHECK_DEBOUNCE_MS);
 }
 
 async function setHostStatus(partial) {

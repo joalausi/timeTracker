@@ -2,13 +2,13 @@ package main
 
 import (
 	"bufio"
-	"path/filepath"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
-	"net/http"
+	"net/url"
 	"os"
+	"path/filepath"
 	"time"
 )
 
@@ -157,6 +157,7 @@ func parseSegment(payload map[string]any) (finalizedSegment, error) {
 	}
 
 	requiredStrings := []string{"url", "category", "rule", "reason"}
+	values := map[string]string{}
 	for _, key := range requiredStrings {
 		value, ok := getString(payload, key)
 		if !ok || value == "" {
