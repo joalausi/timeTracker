@@ -1,18 +1,24 @@
 # Time Tracker
 
-Local Chrome time tracker with native messaging host on Go.
+Local Chrome time tracker powered by a Manifest V3 extension and a Go native messaging host.
 
 ## Current Status
 
 currently in **working baseline** stage:
 
-- Chrome extension (Manifest V3) loads as an unpacked extension
-- service worker starts and runs
-- `chrome.runtime.sendNativeMessage()` works
-- native host is correctly registered on Windows
-- Go host starts from Chrome and responds back to the extension
-- debug `ping` is successful
-- `chrome.runtime.lastError === undefined`
+- Chrome extension (`extension/`) with service worker + popup UI.
+- Native Messaging channel `chrome.runtime.sendNativeMessage(...)` to host `com.example.time_tracker`.
+- Go host (`host/`) that:
+  - accepts `ping`, `event`, `segment`, `stats_today` messages,
+  - appends raw events to `events.jsonl`,
+  - persists finalized segments into SQLite (`tt.sqlite3`),
+  - returns current-day aggregates (`total_ms`, `by_category`, `by_hour`).
+- Popup displays:
+  - host status,
+  - current tracking state,
+  - active site/title/category,
+  - current segment timer,
+  - today summary with per-category breakdown.
 
 In other words: the **channel Chrome Extension ↔ Native Host ↔ Go is already working**.
 
