@@ -23,6 +23,15 @@ const state = {
 let opQueue = Promise.resolve();
 let blurRecheckTimer = null;
 const BLUR_RECHECK_DEBOUNCE_MS = 450;
+const WINDOW_FOCUS_DEBOUNCE_MS = 220;
+let windowFocusTimer = null;
+let pendingFocusWindowId = null;
+let nativePort = null;
+let nativePortConnectedAt = null;
+let nativeRequestSeq = 0;
+const nativePending = new Map();
+let lastWindowFocusEventKey = null;
+let lastIdleEventState = null;
 
 function enqueue(task) {
   opQueue = opQueue
@@ -38,6 +47,18 @@ function clearBlurRecheck() {
     clearTimeout(blurRecheckTimer);
     blurRecheckTimer = null;
   }
+}
+
+function clearWindowFocusDebounce() {
+  if (windowFocusTimer) {
+    clearTimeout(windowFocusTimer);
+    windowFocusTimer = null;
+  }
+}
+
+function nextRequestId() {
+  nativeRequestSeq += 1;
+  return `sw-${Date.now()}-${nativeRequestSeq}`;
 }
 
 function scheduleBlurRecheck(triggerReason = "blur") {
@@ -81,7 +102,7 @@ async function setHostStatus(partial) {
   await chrome.storage.local.set({ [UI_HOST_STATUS_KEY]: next });
 }
 
-function requestHost(payload) {
+function requestHostPing(payload) {
   return new Promise((resolve) => {
     chrome.runtime.sendNativeMessage(HOST, payload, async (resp) => {
       if (chrome.runtime.lastError) {
@@ -105,10 +126,108 @@ function requestHost(payload) {
   });
 }
 
-function sendToHost(payload) {
-  requestHost(payload).catch((err) => {
-    console.warn("[TT] sendToHost requestHost failed", err);
+function teardownNativePort(errorMessage = "native port disconnected") {
+  if (nativePort) {
+    try {
+      nativePort.onMessage.removeListener(handleNativePortMessage);
+      nativePort.onDisconnect.removeListener(handleNativePortDisconnect);
+    } catch {}
+  }
+  nativePort = null;
+  nativePortConnectedAt = null;
+  for (const [, pending] of nativePending.entries()) {
+    pending.resolve({ ok: false, error: errorMessage });
+  }
+  nativePending.clear();
+}
+
+function handleNativePortMessage(resp) {
+  const requestId = resp?.request_id;
+  if (requestId && nativePending.has(requestId)) {
+    const pending = nativePending.get(requestId);
+    nativePending.delete(requestId);
+    pending.resolve(resp || { ok: false, error: "empty response" });
+    return;
+  }
+  console.log("[TT] native port message:", resp);
+}
+
+async function handleNativePortDisconnect() {
+  const error = chrome.runtime.lastError?.message || "native port disconnected";
+  console.warn("[TT] native port disconnected:", error);
+  await setHostStatus({ ok: false, last_error: error });
+  teardownNativePort(error);
+}
+
+async function getNativePort() {
+  if (nativePort) {
+    return nativePort;
+  }
+  try {
+    nativePort = chrome.runtime.connectNative(HOST);
+    nativePortConnectedAt = Date.now();
+    nativePort.onMessage.addListener(handleNativePortMessage);
+    nativePort.onDisconnect.addListener(handleNativePortDisconnect);
+    await setHostStatus({ ok: true, last_error: null, connected_ts_ms: nativePortConnectedAt });
+    console.log("[TT] native port connected");
+    return nativePort;
+  } catch (err) {
+    const error = String(err);
+    await setHostStatus({ ok: false, last_error: error });
+    console.warn("[TT] connectNative failed:", err);
+    throw err;
+  }
+}
+
+async function postToHost(payload, { expectResponse = true } = {}) {
+  const requestId = nextRequestId();
+  const envelope = {
+    ...payload,
+    request_id: requestId,
+  };
+  const port = await getNativePort();
+  return new Promise((resolve) => {
+    if (expectResponse) {
+      const timeoutId = setTimeout(() => {
+        if (!nativePending.has(requestId)) return;
+        nativePending.delete(requestId);
+        resolve({ ok: false, error: "native response timeout" });
+      }, 3000);
+      nativePending.set(requestId, {
+        resolve: (resp) => {
+          clearTimeout(timeoutId);
+          resolve(resp);
+        },
+      });
+    }
+
+    try {
+      port.postMessage(envelope);
+      if (!expectResponse) {
+        resolve({ ok: true, queued: true });
+      }
+    } catch (err) {
+      if (expectResponse && nativePending.has(requestId)) {
+        nativePending.delete(requestId);
+      }
+      resolve({ ok: false, error: String(err) });
+    }
   });
+}
+
+function sendToHost(payload) {
+  postToHost(payload, { expectResponse: false })
+    .then(async (resp) => {
+      if (!resp?.ok) {
+        await setHostStatus({ ok: false, last_error: resp?.error || "native send failed" });
+      } else {
+        await setHostStatus({ ok: true, last_error: null });
+      }
+    })
+    .catch(async (err) => {
+      console.warn("[TT] sendToHost postToHost failed", err);
+      await setHostStatus({ ok: false, last_error: String(err) });
+    });
 }
 
 function normalizeUrl(rawUrl) {
@@ -145,6 +264,19 @@ function isHttpUrl(urlValue) {
 }
 
 function sendRawEvent(name, details = {}) {
+  if (name === "window_focus_changed") {
+    const eventKey = `${details.windowId ?? "none"}:${details.tabId ?? "none"}:${details.url ?? ""}`;
+    if (eventKey === lastWindowFocusEventKey) {
+      return;
+    }
+    lastWindowFocusEventKey = eventKey;
+  }
+  if (name === "idle_state_changed") {
+    if (details.state === lastIdleEventState) {
+      return;
+    }
+    lastIdleEventState = details.state;
+  }
   const event = {
     type: "event",
     name,
@@ -399,15 +531,6 @@ async function storeStatsFromHostResponse(resp) {
   });
 }
 
-async function refreshStatsTodayFromHost() {
-  const resp = await requestHost({ type: "stats_today", ts: Date.now() });
-  if (resp?.ok && resp?.type === "stats_today_ack") {
-    await storeStatsFromHostResponse(resp);
-    return resp;
-  }
-  return resp;
-}
-
 function sameSegmentTarget(segment, target) {
   return (
     segment &&
@@ -464,7 +587,7 @@ async function finalizeSegment(reason) {
   };
 
   console.log("[TT] segment finalize:", payload);
-  const resp = await requestHost(payload);
+  const resp = await postToHost(payload);
   if (resp?.ok) {
     await storeStatsFromHostResponse(resp);
   } else {
@@ -532,7 +655,20 @@ async function bootstrapState() {
   await persistCurrentSegment();
   await publishActiveState();
   await recomputeSegment("bootstrap");
-  await refreshStatsTodayFromHost();
+  const stored = await chrome.storage.local.get(TODAY_SUMMARY_LOCAL_KEY);
+  const summary = stored[TODAY_SUMMARY_LOCAL_KEY];
+  if (summary) {
+    await chrome.storage.local.set({
+      [UI_STATS_TODAY_KEY]: {
+        day: summary.day,
+        total_ms: summary.total_ms || 0,
+        by_category: summary.by_category || {},
+        by_hour: {},
+        source: "local-fallback",
+        updated_ts_ms: Date.now(),
+      },
+    });
+  }
 }
 
 chrome.runtime.onStartup.addListener(() => {
@@ -549,13 +685,13 @@ chrome.runtime.onInstalled.addListener(() => {
 
 chrome.action.onClicked.addListener(() => {
   console.log("[TT] click -> ping");
-  requestHost({ type: "ping", ts: Date.now() });
+  requestHostPing({ type: "ping", ts: Date.now() });
 });
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === "tt_ping_host") {
     enqueue(async () => {
-      const resp = await requestHost({ type: "ping", ts: Date.now(), source: "popup" });
+      const resp = await requestHostPing({ type: "ping", ts: Date.now(), source: "popup" });
       sendResponse(resp || { ok: false, error: "no response" });
     });
     return true;
@@ -563,8 +699,46 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (message?.type === "tt_refresh_stats") {
     enqueue(async () => {
-      const resp = await refreshStatsTodayFromHost();
-      sendResponse(resp || { ok: false, error: "no response" });
+      const stored = await chrome.storage.local.get(TODAY_SUMMARY_LOCAL_KEY);
+      const summary = stored[TODAY_SUMMARY_LOCAL_KEY];
+      if (summary) {
+        const resp = {
+          ok: true,
+          type: "stats_today_ack",
+          stats_today: {
+            day: summary.day,
+            total_ms: summary.total_ms || 0,
+            by_category: summary.by_category || {},
+            by_hour: {},
+          },
+        };
+        await storeStatsFromHostResponse(resp);
+        sendResponse(resp);
+        return;
+      }
+      sendResponse({ ok: true, type: "stats_today_ack", stats_today: { day: null, total_ms: 0, by_category: {}, by_hour: {} } });
+    });
+    return true;
+  }
+
+  if (message?.type === "tt_popup_opened") {
+    enqueue(async () => {
+      state.popupOpen = true;
+      clearBlurRecheck();
+      await publishActiveState();
+      sendResponse({ ok: true });
+    });
+    return true;
+  }
+
+  if (message?.type === "tt_popup_closed") {
+    enqueue(async () => {
+      state.popupOpen = false;
+      if (!state.windowFocused) {
+        scheduleBlurRecheck("popup_closed");
+      }
+      await publishActiveState();
+      sendResponse({ ok: true });
     });
     return true;
   }
@@ -637,34 +811,44 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
 });
 
 chrome.windows.onFocusChanged.addListener((windowId) => {
-  enqueue(async () => {
-    state.windowFocused = windowId !== chrome.windows.WINDOW_ID_NONE;
+  pendingFocusWindowId = windowId;
+  clearWindowFocusDebounce();
+  windowFocusTimer = setTimeout(() => {
+    enqueue(async () => {
+      const effectiveWindowId = pendingFocusWindowId;
+      state.windowFocused = effectiveWindowId !== chrome.windows.WINDOW_ID_NONE;
 
-    let tabId;
-    let url;
-    if (state.windowFocused) {
-      try {
-        await refreshActiveContext(windowId);
-        tabId = state.activeTabId;
-        url = state.activeUrl;
-      } catch (err) {
-        console.warn("[TT] onFocusChanged active tab lookup failed:", err);
+      let tabId;
+      let url;
+      if (state.windowFocused) {
+        clearBlurRecheck();
+        try {
+          await refreshActiveContext(effectiveWindowId);
+          tabId = state.activeTabId;
+          url = state.activeUrl;
+        } catch (err) {
+          console.warn("[TT] onFocusChanged active tab lookup failed:", err);
+        }
+      } else if (state.popupOpen) {
+        scheduleBlurRecheck("popup_blur");
+        await publishActiveState();
+        return;
+      } else {
+        state.activeWindowId = null;
+        state.activeTabId = null;
+        state.activeUrl = undefined;
+        state.activeTitle = undefined;
       }
-    } else {
-      state.activeWindowId = null;
-      state.activeTabId = null;
-      state.activeUrl = undefined;
-      state.activeTitle = undefined;
-    }
 
-    sendRawEvent("window_focus_changed", {
-      windowId,
-      tabId,
-      ...(isHttpUrl(url) ? { url, title: state.activeTitle } : {}),
+      sendRawEvent("window_focus_changed", {
+        windowId: effectiveWindowId,
+        tabId,
+        ...(isHttpUrl(url) ? { url, title: state.activeTitle } : {}),
+      });
+
+      await recomputeSegment(state.windowFocused ? "focus" : "blur");
     });
-
-    await recomputeSegment("blur");
-  });
+  }, WINDOW_FOCUS_DEBOUNCE_MS);
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
