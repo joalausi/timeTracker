@@ -194,97 +194,164 @@ func parseSegment(payload map[string]any) (finalizedSegment, error) {
 type store struct {
 	eventsFile string
 	sqlite     *sqliteStore
+	logFile    string
+}
+
+func (s store) logf(format string, args ...any) {
+	line := fmt.Sprintf(format, args...)
+	fmt.Fprintln(os.Stderr, line)
+	if s.logFile == "" {
+		return
+	}
+	entry := map[string]any{
+		"ts":   time.Now().UnixMilli(),
+		"line": line,
+	}
+	_ = appendJSONL(s.logFile, entry)
 }
 
 func (s store) handleMessage(msg []byte) map[string]any {
 	var payload map[string]any
 	if err := json.Unmarshal(msg, &payload); err != nil {
+		s.logf("[TT] invalid json: %v", err)
 		return map[string]any{
 			"ok":    false,
 			"error": "invalid json",
 		}
 	}
+	if payload == nil {
+		s.logf("[TT] empty payload")
+		return map[string]any{
+			"ok":    false,
+			"type":  "ack",
+			"error": "empty payload",
+		}
+	}
+
+	requestID, _ := payload["request_id"].(string)
+	ack := func(body map[string]any) map[string]any {
+		if requestID != "" {
+			body["request_id"] = requestID
+		}
+		if _, ok := body["type"]; !ok {
+			body["type"] = "ack"
+		}
+		return body
+	}
 
 	msgType, _ := payload["type"].(string)
+	if msgType == "" {
+		s.logf("[TT] missing type in payload")
+		return ack(map[string]any{
+			"ok":    false,
+			"error": "missing message type",
+		})
+	}
 	switch msgType {
 	case "ping":
-		stats, err := s.sqlite.queryStatsToday(time.Now())
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "[TT] stats query error:", err)
+		stats := statsToday{Day: time.Now().Format("2006-01-02"), ByCategory: map[string]int64{}, ByHour: map[string]int64{}}
+		if s.sqlite != nil {
+			var err error
+			stats, err = s.sqlite.queryStatsToday(time.Now())
+			if err != nil {
+				s.logf("[TT] stats query error: %v", err)
+			}
 		}
-		return map[string]any{
+		return ack(map[string]any{
 			"ok":          true,
 			"type":        "ack",
 			"ts":          time.Now().UnixMilli(),
 			"stats_today": stats,
-		}
+		})
 	case "event":
 		if err := validateEvent(payload); err != nil {
-			return map[string]any{
+			s.logf("[TT] event validation error: %v", err)
+			return ack(map[string]any{
 				"ok":    false,
 				"type":  "event_ack",
 				"error": err.Error(),
-			}
+			})
 		}
 		if err := appendJSONL(s.eventsFile, payload); err != nil {
-			return map[string]any{
+			s.logf("[TT] event persist error: %v", err)
+			return ack(map[string]any{
 				"ok":    false,
 				"type":  "event_ack",
 				"error": "failed to persist event",
-			}
+			})
 		}
-		return map[string]any{
+		return ack(map[string]any{
 			"ok":   true,
 			"type": "event_ack",
-		}
+		})
 	case "segment":
 		seg, err := parseSegment(payload)
 		if err != nil {
-			return map[string]any{
+			s.logf("[TT] segment parse error: %v", err)
+			return ack(map[string]any{
 				"ok":    false,
 				"type":  "segment_ack",
 				"error": err.Error(),
-			}
+			})
+		}
+		if s.sqlite == nil {
+			s.logf("[TT] sqlite unavailable; segment accepted without persistence")
+			return ack(map[string]any{
+				"ok":   true,
+				"type": "segment_ack",
+			})
 		}
 		if err := s.sqlite.insertSegment(seg); err != nil {
-			return map[string]any{
+			s.logf("[TT] sqlite insert error: %v", err)
+			return ack(map[string]any{
 				"ok":    false,
 				"type":  "segment_ack",
 				"error": "failed to persist segment",
-			}
+			})
 		}
 		stats, err := s.sqlite.queryStatsToday(time.Now())
 		if err != nil {
-			return map[string]any{
+			s.logf("[TT] stats query error: %v", err)
+			return ack(map[string]any{
 				"ok":    false,
 				"type":  "segment_ack",
 				"error": "failed to query stats",
-			}
+			})
 		}
-		return map[string]any{
+		return ack(map[string]any{
 			"ok":          true,
 			"type":        "segment_ack",
 			"stats_today": stats,
-		}
+		})
 	case "stats_today":
+		if s.sqlite == nil {
+			return ack(map[string]any{
+				"ok":          true,
+				"type":        "stats_today_ack",
+				"stats_today": statsToday{Day: time.Now().Format("2006-01-02"), ByCategory: map[string]int64{}, ByHour: map[string]int64{}},
+			})
+		}
 		stats, err := s.sqlite.queryStatsToday(time.Now())
 		if err != nil {
-			return map[string]any{
+			s.logf("[TT] sqlite stats_today query error: %v", err)
+			return ack(map[string]any{
 				"ok":    false,
 				"type":  "stats_today_ack",
 				"error": "failed to query stats",
-			}
+			})
 		}
-		return map[string]any{
+		return ack(map[string]any{
 			"ok":          true,
 			"type":        "stats_today_ack",
 			"stats_today": stats,
-		}
+		})
 	default:
-		return map[string]any{
-			"ok":    false,
-			"error": "unsupported message type",
-		}
+		s.logf("[TT] unknown message type: %s", msgType)
+		return ack(map[string]any{
+			"ok":      true,
+			"type":    "ack",
+			"ignored": true,
+		})
 	}
 }
 
@@ -294,34 +361,46 @@ func main() {
 		fmt.Fprintln(os.Stderr, "[TT] events path error:", err)
 		return
 	}
-	sqliteStore, dbPath, err := openSQLiteStore()
+	hostLogFile, err := logPath("host.log.jsonl")
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "[TT] sqlite init error:", err)
+		fmt.Fprintln(os.Stderr, "[TT] host log path error:", err)
 		return
 	}
-	defer func() {
-		if err := sqliteStore.close(); err != nil {
-			fmt.Fprintln(os.Stderr, "[TT] sqlite close error:", err)
-		}
-	}()
+	sqliteStore, dbPath, err := openSQLiteStore()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "[TT] sqlite init warning:", err)
+	}
+	if sqliteStore != nil {
+		defer func() {
+			if err := sqliteStore.close(); err != nil {
+				fmt.Fprintln(os.Stderr, "[TT] sqlite close error:", err)
+			}
+		}()
+	}
 	storage := store{
 		eventsFile: eventsFile,
 		sqlite:     sqliteStore,
+		logFile:    hostLogFile,
 	}
-	fmt.Fprintln(os.Stderr, "[TT] host boot, events file:", eventsFile)
-	fmt.Fprintln(os.Stderr, "[TT] host boot, sqlite:", dbPath)
+	if err != nil {
+		storage.logf("[TT] sqlite init warning (continuing without sqlite): %v", err)
+	}
+	storage.logf("[TT] host boot, events file: %s", eventsFile)
+	if dbPath != "" {
+		storage.logf("[TT] host boot, sqlite: %s", dbPath)
+	}
 	for {
 		msg, err := readMsg(os.Stdin)
 		if err != nil {
 			//EOF = Chrome закрыл порт
-			fmt.Fprintln(os.Stderr, "[TT] read:", err)
+			storage.logf("[TT] read: %v", err)
 			return
 		}
-		fmt.Fprintln(os.Stderr, "[TT] got:", string(msg))
+		storage.logf("[TT] got: %s", string(msg))
 
 		resp := storage.handleMessage(msg)
 		if err := writeMsg(os.Stdout, resp); err != nil {
-			fmt.Fprintln(os.Stderr, "[TT] write:", err)
+			storage.logf("[TT] write: %v", err)
 			return
 		}
 	}
