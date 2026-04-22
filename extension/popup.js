@@ -132,7 +132,6 @@ els.reloadBtn.addEventListener("click", () => {
 
 setInterval(render, 1000);
 refreshFromStorage();
-chrome.runtime.sendMessage({ type: "tt_refresh_stats" }).catch(() => {});
 
 async function notifyPopupOpened() {
   if (popupOpenedNotified) return;
